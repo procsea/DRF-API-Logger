@@ -29,22 +29,8 @@ def get_client_ip(request):
         return ''
 
 
-def is_api_logger_enabled():
-    drf_api_logger_database = False
-    if hasattr(settings, 'DRF_API_LOGGER_DATABASE'):
-        drf_api_logger_database = settings.DRF_API_LOGGER_DATABASE
-
-    drf_api_logger_signal = False
-    if hasattr(settings, 'DRF_API_LOGGER_SIGNAL'):
-        drf_api_logger_signal = settings.DRF_API_LOGGER_SIGNAL
-    return drf_api_logger_database or drf_api_logger_signal
-
-
 def database_log_enabled():
-    drf_api_logger_database = False
-    if hasattr(settings, 'DRF_API_LOGGER_DATABASE'):
-        drf_api_logger_database = settings.DRF_API_LOGGER_DATABASE
-    return drf_api_logger_database
+    return getattr(settings, 'DRF_API_LOGGER_DATABASE', False)
 
 
 def mask_sensitive_data(data):

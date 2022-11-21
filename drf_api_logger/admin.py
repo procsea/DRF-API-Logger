@@ -7,6 +7,7 @@ from django.http import HttpResponse
 
 from drf_api_logger.utils import database_log_enabled
 
+# TODO: Find a way to clean that if and still import dynamically
 if database_log_enabled():
     from drf_api_logger.models import APILogsModel
     from django.utils.translation import gettext_lazy as _

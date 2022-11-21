@@ -1,146 +1,108 @@
+import dataclasses
 import json
 import time
-from django.conf import settings
-from django.urls import resolve
+from dataclasses import dataclass, field
+from django.conf import settings as django_settings
 from django.utils import timezone
+from django.core.exceptions import ImproperlyConfigured, MiddlewareNotUsed
 
 from drf_api_logger import API_LOGGER_SIGNAL
 from drf_api_logger.start_logger_when_server_starts import LOGGER_THREAD
 from drf_api_logger.utils import get_headers, get_client_ip, mask_sensitive_data
+from drf_api_logger.middleware.filters import APILogFilter
 
-"""
-File: api_logger_middleware.py
-Class: APILoggerMiddleware
-"""
+
+@dataclass
+class APILoggerSettings:
+    DATABASE: bool = False
+    SIGNAL: bool = False
+    PATH_TYPE: str = 'ABSOLUTE'
+    METHODS: list | tuple = field(default_factory=list)
+    STATUS_CODES: list | tuple = field(default_factory=list)
+    SKIP_URL_NAME: list | tuple = field(default_factory=list)  # TODO: To be deprecated to SKIP_URL_NAMES
+    SKIP_NAMESPACE: list | tuple = field(default_factory=list)  # TODO: To be deprecated to SKIP_URL_NAMESPACES
 
 
 class APILoggerMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
-        # One-time configuration and initialization.
 
-        self.DRF_API_LOGGER_DATABASE = False
-        if hasattr(settings, 'DRF_API_LOGGER_DATABASE'):
-            self.DRF_API_LOGGER_DATABASE = settings.DRF_API_LOGGER_DATABASE
+        # TODO: Voir pour raise une exception pour les params qui sont donnés avec un mauvais type
+        django_settings_prefix = "DRF_API_LOGGER"
+        config = {
+            field.name: getattr(django_settings, f"{django_settings_prefix}_{field.name}", field.default)
+            for field in dataclasses.fields(APILoggerSettings)
+        }
+        self.settings = APILoggerSettings(**config)
 
-        self.DRF_API_LOGGER_SIGNAL = False
-        if hasattr(settings, 'DRF_API_LOGGER_SIGNAL'):
-            self.DRF_API_LOGGER_SIGNAL = settings.DRF_API_LOGGER_SIGNAL
+        if not self.settings.DATABASE or not self.settings.SIGNAL:
+            # Run only if logger is enabled (raising will remove us from the middleware process)
+            raise MiddlewareNotUsed()
 
-        self.DRF_API_LOGGER_PATH_TYPE = 'ABSOLUTE'
-        if hasattr(settings, 'DRF_API_LOGGER_PATH_TYPE'):
-            if settings.DRF_API_LOGGER_PATH_TYPE in ['ABSOLUTE', 'RAW_URI', 'FULL_PATH']:
-                self.DRF_API_LOGGER_PATH_TYPE = settings.DRF_API_LOGGER_PATH_TYPE
+        allowed_path_type = ['ABSOLUTE', 'RAW_URI', 'FULL_PATH']
+        if self.settings.PATH_TYPE not in allowed_path_type:
+            raise ImproperlyConfigured(
+                f"[DRF-API-LOGGER] {django_settings_prefix}_PATH_TYPE should be one of the following:"
+                f" {','.join(allowed_path_type)}"
+            )
 
-        self.DRF_API_LOGGER_SKIP_URL_NAME = []
-        if hasattr(settings, 'DRF_API_LOGGER_SKIP_URL_NAME'):
-            if type(settings.DRF_API_LOGGER_SKIP_URL_NAME) is tuple or type(
-                    settings.DRF_API_LOGGER_SKIP_URL_NAME) is list:
-                self.DRF_API_LOGGER_SKIP_URL_NAME = settings.DRF_API_LOGGER_SKIP_URL_NAME
+        # Method to call on the request object to get the url logged as the user wants it
+        resolver_from_path_type = {
+            "ABSOLUTE": "build_absolute_uri",
+            "FULL_PATH": "get_full_path",
+            "RAW_URI": "get_raw_uri",
+        }
+        self.request_resolver_callable_name = resolver_from_path_type[self.settings.PATH_TYPE]
 
-        self.DRF_API_LOGGER_SKIP_NAMESPACE = []
-        if hasattr(settings, 'DRF_API_LOGGER_SKIP_NAMESPACE'):
-            if type(settings.DRF_API_LOGGER_SKIP_NAMESPACE) is tuple or type(
-                    settings.DRF_API_LOGGER_SKIP_NAMESPACE) is list:
-                self.DRF_API_LOGGER_SKIP_NAMESPACE = settings.DRF_API_LOGGER_SKIP_NAMESPACE
+        self.api_call_filter = APILogFilter(self.settings)
 
-        self.DRF_API_LOGGER_METHODS = []
-        if hasattr(settings, 'DRF_API_LOGGER_METHODS'):
-            if type(settings.DRF_API_LOGGER_METHODS) is tuple or type(
-                    settings.DRF_API_LOGGER_METHODS) is list:
-                self.DRF_API_LOGGER_METHODS = settings.DRF_API_LOGGER_METHODS
-
-        self.DRF_API_LOGGER_STATUS_CODES = []
-        if hasattr(settings, 'DRF_API_LOGGER_STATUS_CODES'):
-            if type(settings.DRF_API_LOGGER_STATUS_CODES) is tuple or type(
-                    settings.DRF_API_LOGGER_STATUS_CODES) is list:
-                self.DRF_API_LOGGER_STATUS_CODES = settings.DRF_API_LOGGER_STATUS_CODES
+        # TODO: Raise in case METHODS ne sont pas dans les méthodes HTTP connues
 
     def __call__(self, request):
+        # We require the final response to check if it should be filtered or not,
+        # so we can generate it from the start.
+        start_time = time.time()
+        response = self.get_response(request)
+        execution_time = time.time() - start_time
 
-        # Run only if logger is enabled.
-        if self.DRF_API_LOGGER_DATABASE or self.DRF_API_LOGGER_SIGNAL:
+        if self.api_call_filter.is_filtered(request, response):
+            return response
 
-            url_name = resolve(request.path_info).url_name
-            namespace = resolve(request.path_info).namespace
+        request_data = ''
+        try:
+            request_data = json.loads(request.body) if request.body else ''
+        except Exception:
+            pass
 
-            # Always skip Admin panel
-            if namespace == 'admin':
-                return self.get_response(request)
-
-            # Skip for url name
-            if url_name in self.DRF_API_LOGGER_SKIP_URL_NAME:
-                return self.get_response(request)
-
-            # Skip entire app using namespace
-            if namespace in self.DRF_API_LOGGER_SKIP_NAMESPACE:
-                return self.get_response(request)
-
-            start_time = time.time()
-            request_data = ''
-            try:
-                request_data = json.loads(request.body) if request.body else ''
-            except:
-                pass
-
-            # Code to be executed for each request before
-            # the view (and later middleware) are called.
-            response = self.get_response(request)
-
-            # Only log required status codes if matching
-            if self.DRF_API_LOGGER_STATUS_CODES and response.status_code not in self.DRF_API_LOGGER_STATUS_CODES:
-                return response
-
-            # Code to be executed for each request/response after
-            # the view is called.
-
-            headers = get_headers(request=request)
-            method = request.method
-
-            # Log only registered methods if available.
-            if len(self.DRF_API_LOGGER_METHODS) > 0 and method not in self.DRF_API_LOGGER_METHODS:
-                return response
-
-            if response.get('content-type') in ('application/json', 'application/vnd.api+json',):
-                if getattr(response, 'streaming', False):
-                    response_body = '** Streaming **'
-                else:
-                    if type(response.content) == bytes:
-                        response_body = json.loads(response.content.decode())
-                    else:
-                        response_body = json.loads(response.content)
-                if self.DRF_API_LOGGER_PATH_TYPE == 'ABSOLUTE':
-                    api = request.build_absolute_uri()
-                elif self.DRF_API_LOGGER_PATH_TYPE == 'FULL_PATH':
-                    api = request.get_full_path()
-                elif self.DRF_API_LOGGER_PATH_TYPE == 'RAW_URI':
-                    api = request.get_raw_uri()
-                else:
-                    api = request.build_absolute_uri()
-
-                data = dict(
-                    api=api,
-                    headers=mask_sensitive_data(headers),
-                    body=mask_sensitive_data(request_data),
-                    method=method,
-                    client_ip_address=get_client_ip(request),
-                    response=mask_sensitive_data(response_body),
-                    status_code=response.status_code,
-                    execution_time=time.time() - start_time,
-                    added_on=timezone.now()
-                )
-                if self.DRF_API_LOGGER_DATABASE:
-                    if LOGGER_THREAD:
-                        d = data.copy()
-                        d['headers'] = json.dumps(d['headers'], indent=4, ensure_ascii=False)
-                        if request_data:
-                            d['body'] = json.dumps(d['body'], indent=4, ensure_ascii=False)
-                        d['response'] = json.dumps(d['response'], indent=4, ensure_ascii=False)
-                        LOGGER_THREAD.put_log_data(data=d)
-                if self.DRF_API_LOGGER_SIGNAL:
-                    API_LOGGER_SIGNAL.listen(**data)
-            else:
-                return response
+        if getattr(response, 'streaming', False):
+            response_body = '** Streaming **'
         else:
-            response = self.get_response(request)
-        return response
+            # TODO: Check if needed, because json.loads() accepts a bytes instance
+            if type(response.content) == bytes:
+                response_body = json.loads(response.content.decode())
+            else:
+                response_body = json.loads(response.content)
+
+        headers = get_headers(request=request)
+        api_call_url = getattr(request, self.request_resolver_callable_name)()
+        data = dict(
+            api=api_call_url,
+            headers=mask_sensitive_data(headers),
+            body=mask_sensitive_data(request_data),
+            method=request.method,
+            client_ip_address=get_client_ip(request),
+            response=mask_sensitive_data(response_body),
+            status_code=response.status_code,
+            execution_time=execution_time,
+            added_on=timezone.now()
+        )
+        if self.settings.DATABASE:
+            if LOGGER_THREAD:
+                d = data.copy()
+                d['headers'] = json.dumps(d['headers'], indent=4, ensure_ascii=False)
+                if request_data:
+                    d['body'] = json.dumps(d['body'], indent=4, ensure_ascii=False)
+                d['response'] = json.dumps(d['response'], indent=4, ensure_ascii=False)
+                LOGGER_THREAD.put_log_data(data=d)
+        if self.settings.SIGNAL:
+            API_LOGGER_SIGNAL.listen(**data)
