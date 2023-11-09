@@ -1,9 +1,10 @@
 import re
 from django.conf import settings
+from collections.abc import Sequence, Mapping
 
 SENSITIVE_KEYS = ['password', 'token', 'access', 'refresh']
 if hasattr(settings, 'DRF_API_LOGGER_EXCLUDE_KEYS'):
-    if type(settings.DRF_API_LOGGER_EXCLUDE_KEYS) in (list, tuple):
+    if isinstance(settings.DRF_API_LOGGER_EXCLUDE_KEYS, Sequence):
         SENSITIVE_KEYS.extend(settings.DRF_API_LOGGER_EXCLUDE_KEYS)
 
 
@@ -39,7 +40,7 @@ def mask_sensitive_data(data):
     Loops recursively over nested dictionaries.
     """
 
-    if type(data) != dict:
+    if not isinstance(data, dict):
         return data
 
     for key, value in data.items():

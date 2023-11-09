@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import time
+import logging
 from dataclasses import dataclass, field
 from django.conf import settings as django_settings
 from django.utils import timezone
@@ -10,6 +11,9 @@ from drf_api_logger import API_LOGGER_SIGNAL
 from drf_api_logger.start_logger_when_server_starts import LOGGER_THREAD
 from drf_api_logger.utils import get_headers, get_client_ip, mask_sensitive_data
 from drf_api_logger.middleware.filters import APILogFilter
+
+logger = logging.getLogger(__name__)
+log_prefix = "######->>"
 
 
 @dataclass
@@ -25,18 +29,22 @@ class APILoggerSettings:
 
 class APILoggerMiddleware:
     def __init__(self, get_response):
+        logger.debug(f"{log_prefix} Initiating DRF-API-Logger")
         self.get_response = get_response
 
         # TODO: Voir pour raise une exception pour les params qui sont donnés avec un mauvais type
         django_settings_prefix = "DRF_API_LOGGER"
-        config = {
-            field.name: getattr(django_settings, f"{django_settings_prefix}_{field.name}", field.default)
-            for field in dataclasses.fields(APILoggerSettings)
-        }
+        config = {}
+        for _field in dataclasses.fields(APILoggerSettings):
+            setting_name = f"{django_settings_prefix}_{_field.name}"
+            setting_value = getattr(django_settings, setting_name, None)
+            if setting_value is not None:
+                config[_field.name] = setting_value
+
         self.settings = APILoggerSettings(**config)
 
-        if not self.settings.DATABASE or not self.settings.SIGNAL:
-            # Run only if logger is enabled (raising will remove us from the middleware process)
+        if not self.settings.DATABASE and not self.settings.SIGNAL:
+            # Run only if logger is enabled (raising will deregister us from the middleware process)
             raise MiddlewareNotUsed()
 
         allowed_path_type = ['ABSOLUTE', 'RAW_URI', 'FULL_PATH']
@@ -61,11 +69,13 @@ class APILoggerMiddleware:
     def __call__(self, request):
         # We require the final response to check if it should be filtered or not,
         # so we can generate it from the start.
+        logger.debug(f"{log_prefix} New API call...")
         start_time = time.time()
         response = self.get_response(request)
         execution_time = time.time() - start_time
 
         if self.api_call_filter.is_filtered(request, response):
+            logger.debug(f"{log_prefix} API call filtered - Returning")
             return response
 
         request_data = ''
@@ -77,11 +87,7 @@ class APILoggerMiddleware:
         if getattr(response, 'streaming', False):
             response_body = '** Streaming **'
         else:
-            # TODO: Check if needed, because json.loads() accepts a bytes instance
-            if type(response.content) == bytes:
-                response_body = json.loads(response.content.decode())
-            else:
-                response_body = json.loads(response.content)
+            response_body = json.loads(response.content)
 
         headers = get_headers(request=request)
         api_call_url = getattr(request, self.request_resolver_callable_name)()
@@ -106,3 +112,5 @@ class APILoggerMiddleware:
                 LOGGER_THREAD.put_log_data(data=d)
         if self.settings.SIGNAL:
             API_LOGGER_SIGNAL.listen(**data)
+
+        return response
